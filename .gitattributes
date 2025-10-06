@@ -1,0 +1,5 @@
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+MeetingProgram/models/models--Systran--faster-whisper-base/blobs/* filter=lfs diff=lfs merge=lfs -text
+MeetingProgram/models/models--google--gemma-3-270m/blobs/* filter=lfs diff=lfs merge=lfs -text
