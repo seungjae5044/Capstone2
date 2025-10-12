@@ -1,0 +1,21 @@
+{
+    "model_id": "openai/whisper-large-v3-turbo",
+    "language": "ko",
+    "force_device": null,
+    "audio_source_sr": 48000,
+    "target_sr": 16000,
+    "chunk_length_s": 5,
+    "stride_seconds": 0.8,
+    "chunk_duration": 5.0,
+    "blocksize_seconds": 0.2,
+    "queue_maxsize": 100,
+    "batch_size": 1,
+    "silence_rms_threshold": 0.02,
+    "generate_kwargs": {
+        "task": "transcribe",
+        "temperature": 0.0,
+        "no_speech_threshold": 0.6,
+        "logprob_threshold": -1.0,
+        "repetition_penalty": 1.5
+    }
+  }

@@ -13,10 +13,11 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
+import time
 from math import gcd
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -99,19 +100,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "force_device": None,
     "audio_source_sr": 48000,
     "target_sr": 16000,
-    "chunk_length_s": 12,
-    "stride_seconds": 0.4,
+    "chunk_length_s": 5,
+    "stride_seconds": 0.8,
     "chunk_duration": 5.0,
     "blocksize_seconds": 0.2,
     "queue_maxsize": 100,
     "batch_size": 1,
-    "silence_rms_threshold": 0.005,
+    "silence_rms_threshold": 0.02,
     "generate_kwargs": {
         "task": "transcribe",
         "temperature": 0.0,
         "no_speech_threshold": 0.6,
         "logprob_threshold": -1.0,
-        "repetition_penalty": 1.05,
+        "repetition_penalty": 1.2,
     },
 }
 
@@ -160,8 +161,6 @@ def select_device(force_device: Optional[str]) -> tuple[str, torch.dtype]:
 
 @dataclass
 class WhisperConfig:
-    """Whisper 전사에 필요한 설정"""
-
     model_id: str
     language: str
     audio_source_sr: int
@@ -177,9 +176,247 @@ class WhisperConfig:
     force_device: Optional[str] = None
 
 
-class TranscriptionService:
-    """Whisper 실시간 전사를 관리한다."""
+@dataclass
+class TranscribedSegment:
+    text: str
+    speaker_id: str
+    speaker_name: str
+    similarity: float
+    start_time: datetime
+    end_time: datetime
+    duration: float
 
+
+@dataclass
+class SpeakerProfile:
+    speaker_id: str
+    display_name: str
+    embedding: np.ndarray
+    statement_count: int = 0
+    duration: float = 0.0
+    last_similarity: float = 1.0
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def update_embedding(self, embedding: np.ndarray, alpha: float) -> None:
+        if not np.any(self.embedding):
+            self.embedding = embedding
+        else:
+            self.embedding = (1.0 - alpha) * self.embedding + alpha * embedding
+        self.embedding = self.embedding / (np.linalg.norm(self.embedding) + 1e-8)
+
+
+@dataclass
+class TimelineSegment:
+    speaker_id: str
+    speaker_name: str
+    start_time: datetime
+    end_time: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "speaker_id": self.speaker_id,
+            "speaker_name": self.speaker_name,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat(),
+            "duration": (self.end_time - self.start_time).total_seconds(),
+        }
+
+
+class SileroVAD:
+    def __init__(self, threshold: float = 0.5, device: str = "cpu") -> None:
+        self.threshold = threshold
+        self.device = device
+        self.model = None
+        self.get_speech_ts = None
+        self.lock = threading.Lock()
+
+    def _initialize(self) -> None:
+        with self.lock:
+            if self.model is not None and self.get_speech_ts is not None:
+                return
+            model, utils = torch.hub.load(
+                "snakers4/silero-vad",
+                "silero_vad",
+                force_reload=False,
+                onnx=False,
+            )
+            self.model = model.to("cpu")
+            self.get_speech_ts = utils[0]
+
+    def is_speech(self, audio: np.ndarray, sr: int) -> bool:
+        if audio.size < max(1600, int(sr * 0.2)):
+            return False
+        if self.model is None or self.get_speech_ts is None:
+            self._initialize()
+        if self.model is None or self.get_speech_ts is None:
+            return False
+        audio_tensor = torch.from_numpy(audio.astype(np.float32))
+        with torch.no_grad():
+            speech_timestamps = self.get_speech_ts(
+                audio_tensor,
+                self.model,
+                sampling_rate=sr,
+                threshold=self.threshold,
+                return_seconds=False,
+            )
+        return bool(speech_timestamps)
+
+
+class SpeechBrainEncoder:
+    def __init__(self, device: str = "cpu") -> None:
+        self.device = device if device == "cuda" else "cpu"
+        self.encoder = None
+        self.lock = threading.Lock()
+
+    def _initialize(self) -> None:
+        with self.lock:
+            if self.encoder is not None:
+                return
+            from speechbrain.pretrained import EncoderClassifier
+
+            self.encoder = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                run_opts={"device": self.device},
+            )
+
+    def embed(self, audio: np.ndarray, sr: int) -> Optional[np.ndarray]:
+        if audio.size == 0:
+            return None
+        if self.encoder is None:
+            self._initialize()
+        if self.encoder is None:
+            return None
+        waveform = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0)
+        waveform = waveform.to(self.device)
+        with torch.no_grad():
+            embedding = self.encoder.encode_batch(waveform)
+        emb = embedding.squeeze().cpu().numpy()
+        norm = np.linalg.norm(emb) + 1e-8
+        return emb / norm
+
+
+class SpeakerHandler:
+    def __init__(
+        self,
+        max_speakers: int = 10,
+        similarity_threshold: float = 0.35,
+        update_alpha: float = 0.2,
+    ) -> None:
+        self.max_speakers = max_speakers
+        self.similarity_threshold = similarity_threshold
+        self.update_alpha = update_alpha
+        self._counter = 1
+        self._profiles: Dict[str, SpeakerProfile] = {}
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._counter = 1
+            self._profiles.clear()
+
+    def classify(self, embedding: Optional[np.ndarray]) -> Tuple[str, SpeakerProfile, float]:
+        if embedding is None or not np.any(embedding):
+            return self._assign_default()
+
+        with self._lock:
+            best_id = None
+            best_sim = -1.0
+            for speaker_id, profile in self._profiles.items():
+                similarity = float(np.dot(profile.embedding, embedding))
+                if similarity > best_sim:
+                    best_sim = similarity
+                    best_id = speaker_id
+
+            if best_id is None or best_sim < self.similarity_threshold:
+                speaker_id, profile = self._create_profile(embedding)
+                best_sim = 1.0
+            else:
+                profile = self._profiles[best_id]
+                profile.update_embedding(embedding, self.update_alpha)
+                speaker_id = best_id
+
+            return speaker_id, profile, best_sim
+
+    def register_segment(self, speaker_id: str, duration: float, similarity: float) -> None:
+        with self._lock:
+            profile = self._profiles.get(speaker_id)
+            if profile is None:
+                profile_id, profile = self._create_profile(np.zeros(1, dtype=np.float32))
+                speaker_id = profile_id
+            profile.statement_count += 1
+            profile.duration += duration
+            profile.last_similarity = similarity
+            profile.updated_at = datetime.utcnow()
+
+    def _assign_default(self) -> Tuple[str, SpeakerProfile, float]:
+        with self._lock:
+            if not self._profiles:
+                speaker_id, profile = self._create_profile(np.zeros(1, dtype=np.float32))
+            else:
+                speaker_id = next(iter(self._profiles))
+                profile = self._profiles[speaker_id]
+            return speaker_id, profile, 0.0
+
+    def _create_profile(self, embedding: np.ndarray) -> Tuple[str, SpeakerProfile]:
+        speaker_id = f"speaker_{self._counter}"
+        display_name = f"Speaker {self._counter}"
+        normalized = embedding
+        if np.any(embedding):
+            normalized = embedding / (np.linalg.norm(embedding) + 1e-8)
+        profile = SpeakerProfile(
+            speaker_id=speaker_id,
+            display_name=display_name,
+            embedding=normalized,
+        )
+        self._profiles[speaker_id] = profile
+        self._counter = min(self._counter + 1, self.max_speakers + 1)
+        return speaker_id, profile
+
+    def get_profiles(self) -> List[SpeakerProfile]:
+        with self._lock:
+            return [profile for profile in self._profiles.values()]
+
+    def get_profile(self, speaker_id: str) -> Optional[SpeakerProfile]:
+        with self._lock:
+            return self._profiles.get(speaker_id)
+
+
+class TimelineManager:
+    def __init__(self) -> None:
+        self._segments: List[TimelineSegment] = []
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._segments = []
+
+    def add_segment(self, speaker_id: str, speaker_name: str, start: datetime, end: datetime) -> None:
+        with self._lock:
+            if self._segments and self._segments[-1].speaker_id == speaker_id:
+                self._segments[-1].end_time = end
+            else:
+                self._segments.append(
+                    TimelineSegment(
+                        speaker_id=speaker_id,
+                        speaker_name=speaker_name,
+                        start_time=start,
+                        end_time=end,
+                    )
+                )
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [segment.to_dict() for segment in self._segments]
+
+    def latest(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not self._segments:
+                return None
+            return self._segments[-1].to_dict()
+
+
+class TranscriptionService:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.pipeline = None
@@ -189,12 +426,16 @@ class TranscriptionService:
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.audio_queue: Optional[queue.Queue] = None
-        self.segment_callback: Optional[Callable[[str], None]] = None
+        self.segment_callback: Optional[Callable[[TranscribedSegment], None]] = None
         self.lock = threading.Lock()
 
         # 동적 파라미터
         self.resample_up = 1
         self.resample_down = 1
+        self.vad = SileroVAD()
+        self.encoder = SpeechBrainEncoder()
+        self.speakers = SpeakerHandler()
+        self.timeline = TimelineManager()
 
     def initialize(self) -> None:
         """Whisper 파이프라인을 초기화한다."""
@@ -245,7 +486,11 @@ class TranscriptionService:
     def is_running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, callback: Callable[[str], None]) -> None:
+    def reset_state(self) -> None:
+        self.speakers.reset()
+        self.timeline.reset()
+
+    def start(self, callback: Callable[[TranscribedSegment], None]) -> None:
         """전사를 시작한다."""
 
         if self.pipeline is None:
@@ -256,6 +501,7 @@ class TranscriptionService:
 
         self.segment_callback = callback
         self.stop_event.clear()
+        self.reset_state()
         self.audio_queue = queue.Queue(maxsize=self.config.queue_maxsize if self.config else 100)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -276,13 +522,33 @@ class TranscriptionService:
         self.audio_queue = None
         logger.info("실시간 전사 스레드 종료")
 
+    def speaker_summaries(self) -> List[Dict[str, Any]]:
+        summaries: List[Dict[str, Any]] = []
+        for profile in self.speakers.get_profiles():
+            summaries.append(
+                {
+                    "speaker_id": profile.speaker_id,
+                    "name": profile.display_name,
+                    "count": profile.statement_count,
+                    "duration": profile.duration,
+                    "last_similarity": profile.last_similarity,
+                    "updated_at": profile.updated_at.isoformat(),
+                }
+            )
+        return summaries
+
+    def timeline_snapshot(self) -> List[Dict[str, Any]]:
+        return self.timeline.snapshot()
+
+    def timeline_latest(self) -> Optional[Dict[str, Any]]:
+        return self.timeline.latest()
+
     def _run(self) -> None:
         if self.config is None or self.pipeline is None:
             return
 
         blocksize = max(1, int(self.config.audio_source_sr * self.config.blocksize_seconds))
         batch_size = self.config.batch_size
-        silence_rms_threshold = self.config.silence_rms_threshold
         stride_seconds = self.config.stride_seconds
         chunk_duration = self.config.chunk_duration
         target_sr = self.config.target_sr
@@ -339,10 +605,18 @@ class TranscriptionService:
                         continue
 
                     audio_data_np = np.concatenate(full_audio_buffer)
-                    rms_level = float(np.sqrt(np.mean(np.square(audio_data_np)))) if audio_data_np.size else 0.0
-                    if rms_level < silence_rms_threshold:
+                    if audio_data_np.size == 0:
                         full_audio_buffer = []
                         continue
+
+                    if not self.vad.is_speech(audio_data_np, target_sr):
+                        full_audio_buffer = []
+                        continue
+
+                    embedding = self.encoder.embed(audio_data_np, target_sr)
+                    speaker_id, profile, similarity = self.speakers.classify(embedding)
+                    segment_end = datetime.utcnow()
+                    segment_start = segment_end - timedelta(seconds=total_duration)
 
                     with torch.inference_mode():
                         result = self.pipeline(
@@ -361,7 +635,23 @@ class TranscriptionService:
                         new_segment = current_text
 
                     if new_segment and self.segment_callback:
-                        self.segment_callback(new_segment)
+                        self.speakers.register_segment(speaker_id, total_duration, similarity)
+                        self.timeline.add_segment(
+                            speaker_id,
+                            profile.display_name,
+                            segment_start,
+                            segment_end,
+                        )
+                        segment = TranscribedSegment(
+                            text=new_segment,
+                            speaker_id=speaker_id,
+                            speaker_name=profile.display_name,
+                            similarity=similarity,
+                            start_time=segment_start,
+                            end_time=segment_end,
+                            duration=total_duration,
+                        )
+                        self.segment_callback(segment)
 
                     prev_transcription = current_text
 
@@ -384,6 +674,7 @@ transcription_service = TranscriptionService(CONFIG_PATH)
 @dataclass
 class MeetingState:
     session_id: Optional[str] = None
+    last_session_id: Optional[str] = None
     topic: str = ""
     speaker_id: str = "Speaker 1"
     is_active: bool = False
@@ -452,7 +743,19 @@ class MeetingStatistics:
 
     def speaker_dict(self) -> Dict[str, Any]:
         with self.lock:
-            return {speaker: stats.to_dict() for speaker, stats in self.speakers.items()}
+            data = {speaker: stats.to_dict() for speaker, stats in self.speakers.items()}
+        for summary in transcription_service.speaker_summaries():
+            speaker_id = summary["speaker_id"]
+            entry = data.setdefault(
+                speaker_id,
+                {
+                    "total_statements": summary["count"],
+                    "avg_topic_relevance": 0.0,
+                    "avg_novelty": 0.0,
+                },
+            )
+            entry["total_duration"] = summary["duration"]
+        return data
 
 
 meeting_stats = MeetingStatistics()
@@ -462,6 +765,11 @@ meeting_history_lock = threading.Lock()
 meeting_history: List[Dict[str, Any]] = []
 last_report_path: Optional[Path] = None
 last_summary_payload: Optional[Dict[str, Any]] = None
+
+# 간단한 전사 중복 방지용 상태 (텍스트/화자/시간)
+_last_transcription_text: Optional[str] = None
+_last_transcription_speaker: Optional[str] = None
+_last_transcription_ts: float = 0.0
 
 REPORTS_DIR = Path("output") / "reports"
 
@@ -477,108 +785,128 @@ GEMMA_SYSTEM_PROMPT = (
 
 
 class OllamaEvaluator:
-    """Ollama 서버의 Gemma 모델을 활용해 발언을 평가한다."""
+    """Ollama 서버의 Gemma 모델을 활용해 발언을 평가한다.
 
-    def __init__(self, model: str = "gemma3:1B", base_url: str = "http://localhost:11434") -> None:
+    변경된 모델 I/O에 맞춰 단일 프롬프트로 평가하며,
+    화자별 누적 컨텍스트(speaker_context)를 유지한다.
+    """
+
+    def __init__(self, model: str = "gemma3-270m-local-e3", base_url: str = "http://localhost:11434") -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.meeting_topic = ""
-        self.history: List[str] = []
         self.lock = threading.Lock()
+        # 화자별 이전 발언 누적 (현재 세션 한정)
+        self._speaker_history: Dict[str, List[str]] = {}
+        # 컨텍스트 최대 길이 (문자)
+        self.max_ctx_chars: int = int(os.environ.get("SPEAKER_CONTEXT_CHARS", 400))
 
     def initialize(self, topic: str) -> None:
         with self.lock:
             self.meeting_topic = topic
-            self.history.clear()
+            self._speaker_history.clear()
 
-    def evaluate(self, text: str, speaker_id: str) -> Dict[str, float]:
-        with self.lock:
-            recent_texts = list(self.history[-3:])
+    def _clamp_tail(self, text: str, limit: int) -> str:
+        if not text or limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        return "…" + text[-(limit - 1) :]
 
-        topic_prompt = self._create_topic_prompt(text)
-        novelty_prompt = self._create_novelty_prompt(text, recent_texts)
+    def _get_speaker_context_text(self, speaker_id: str) -> str:
+        history = self._speaker_history.get(speaker_id) or []
+        context_text = " ".join(history).strip()
+        return self._clamp_tail(context_text, self.max_ctx_chars)
 
-        topic_score = self._query_model(topic_prompt, "topic_relevance", default=5.0)
-        novelty_default = 8.0 if not recent_texts else 5.0
-        novelty_score = self._query_model(novelty_prompt, "novelty", default=novelty_default)
+    def _append_speaker_sentence(self, speaker_id: str, sentence: str) -> None:
+        if not sentence:
+            return
+        history = self._speaker_history.setdefault(speaker_id, [])
+        history.append(sentence)
+        # 간단한 메모리 제어: 너무 많은 항목이면 앞부분 제거
+        if len(history) > 200:
+            del history[: len(history) - 200]
 
-        with self.lock:
-            self.history.append(text)
-
-        return {
-            "topic_relevance": topic_score,
-            "novelty": novelty_score,
-        }
-
-    def _create_topic_prompt(self, text: str) -> str:
+    def _build_prompt(self, topic: str, speaker_id: str, speaker_context: str, sentence: str) -> str:
+        # 파인튜닝 데이터와 동일한 형식
         return (
-            f"{GEMMA_SYSTEM_PROMPT}\n\n"
-            f"회의 주제: {self.meeting_topic}\n"
-            f'평가할 발언: "{text}"\n\n'
-            "이 발언이 회의 주제와 얼마나 관련이 있는지 0-10점으로 평가하세요.\n"
-            "0점: 전혀 관련 없음\n"
-            "5점: 보통\n"
-            "10점: 매우 관련 있음\n\n"
-            "JSON 형식으로 답변하세요:\n"
-            "{\"topic_relevance\": 점수}\n\n"
-            "평가:"
+            f"topic: {topic}\n"
+            f"speaker_id: {speaker_id}\n"
+            f"speaker_context: {speaker_context or '없음'}\n"
+            f"sentence: {sentence}\n"
         )
 
-    def _create_novelty_prompt(self, text: str, recent_texts: List[str]) -> str:
-        context_lines = "\n".join(f"- {t}" for t in recent_texts) if recent_texts else "(이전 발언 없음)"
-        return (
-            f"{GEMMA_SYSTEM_PROMPT}\n\n"
-            "최근 회의 발언들:\n"
-            f"{context_lines}\n\n"
-            f'새로운 발언: "{text}"\n\n'
-            "이 발언이 최근 발언들과 비교하여 얼마나 새로운 정보나 관점을 제공하는지 0-10점으로 평가하세요.\n"
-            "0점: 완전한 반복\n"
-            "5점: 부분적으로 새로움\n"
-            "10점: 완전히 새로운 정보/관점\n\n"
-            "JSON 형식으로 답변하세요:\n"
-            "{\"novelty\": 점수}\n\n"
-            "평가:"
-        )
-
-    def _query_model(self, prompt: str, score_key: str, default: float) -> float:
+    def _call_model(self, prompt: str, timeout: float = 60.0) -> str:
         payload = {"model": self.model, "prompt": prompt, "stream": False}
         try:
             response = requests.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
-                timeout=60,
+                timeout=timeout,
             )
             response.raise_for_status()
             data = response.json()
-            raw_text = data.get("response", "")
-            return self._extract_score(raw_text, score_key, default)
+            return data.get("response", "")
         except requests.exceptions.RequestException as exc:  # noqa: PERF203
             logger.error("Ollama 요청 실패: %s", exc)
-            return default
+            return ""
         except ValueError as exc:
             logger.error("Ollama 응답 파싱 실패: %s", exc)
-            return default
+            return ""
 
-    def _extract_score(self, response_text: str, score_key: str, default: float) -> float:
-        json_match = re.search(r"\{[^}]*\}", response_text)
-        if json_match:
-            try:
-                payload = json.loads(json_match.group(0))
-                if score_key in payload:
-                    return float(payload[score_key])
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+    def _parse_reason_and_scores(self, response_text: str) -> Tuple[str, float, float]:
+        text = (response_text or "").strip()
+        if not text:
+            return "", 5.0, 5.0
 
-        number_match = re.search(r"(\d+(?:\.\d+)?)", response_text)
-        if number_match:
-            try:
-                value = float(number_match.group(1))
-                return max(0.0, min(10.0, value))
-            except ValueError:
-                pass
-        return default
+        # 괄호로 끝나는 "… (x, y)" 패턴 우선 추출
+        m = re.search(r"\(([^)]*)\)\s*$", text)
+        topic_score = 5.0
+        novelty_score = 5.0
+        reason = text
+        if m:
+            inside = m.group(1)
+            # 쉼표 또는 공백 구분 허용
+            parts = [p.strip() for p in re.split(r"[,\s]+", inside) if p.strip()]
+            if len(parts) >= 2:
+                try:
+                    topic_score = float(parts[0])
+                    novelty_score = float(parts[1])
+                except ValueError:
+                    pass
+            # 괄호 제거한 나머지를 이유로 사용
+            reason = text[: m.start()].rstrip()
 
-OLLAMA_MODEL = os.environ.get("OLLAMA_GEMMA_MODEL", "gemma3:1B")
+        # 0~10 범위로 클램프
+        topic_score = max(0.0, min(10.0, topic_score))
+        novelty_score = max(0.0, min(10.0, novelty_score))
+        return reason, topic_score, novelty_score
+
+    def evaluate(self, sentence: str, speaker_id: str) -> Dict[str, Any]:
+        """단일 프롬프트(주제/화자/컨텍스트/문장)로 평가 후 점수/코멘트 반환.
+
+        반환: {"topic_relevance": float, "novelty": float, "comment": str}
+        """
+        # 현재 화자의 이전 발언으로 컨텍스트 구성
+        with self.lock:
+            topic = self.meeting_topic
+            speaker_context = self._get_speaker_context_text(speaker_id)
+
+        prompt = self._build_prompt(topic, speaker_id, speaker_context, sentence)
+        raw = self._call_model(prompt)
+        reason, topic_score, novelty_score = self._parse_reason_and_scores(raw)
+
+        # 평가 이후 현재 문장을 화자 컨텍스트에 추가
+        with self.lock:
+            self._append_speaker_sentence(speaker_id, sentence)
+
+        return {
+            "topic_relevance": topic_score,
+            "novelty": novelty_score,
+            "comment": reason,
+        }
+
+OLLAMA_MODEL = os.environ.get("OLLAMA_GEMMA_MODEL", "gemma3-270m-local-e3")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 ollama_evaluator = OllamaEvaluator(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL)
@@ -618,31 +946,126 @@ def broadcast_session_status() -> None:
     )
 
 
-def handle_transcription(text: str) -> None:
-    cleaned = text.strip()
+def build_speaker_stats_payload(
+    overall_stats: Dict[str, Any],
+    speaker_stats: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    speaker_summaries = transcription_service.speaker_summaries()
+    total_duration = sum(item["duration"] for item in speaker_summaries) or 0.0
+    speakers_payload: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for summary in speaker_summaries:
+        speaker_id = summary["speaker_id"]
+        stats = speaker_stats.get(speaker_id, {})
+        duration = summary["duration"]
+        participation = (duration / total_duration * 100.0) if total_duration else 0.0
+        speakers_payload.append(
+            {
+                "speaker_id": speaker_id,
+                "name": summary["name"],
+                "count": summary["count"],
+                "duration": duration,
+                "topic_avg": stats.get("avg_topic_relevance", 0.0) or 0.0,
+                "novelty_avg": stats.get("avg_novelty", 0.0) or 0.0,
+                "participation": participation,
+            }
+        )
+        seen.add(speaker_id)
+
+    for speaker_id, stats in speaker_stats.items():
+        if speaker_id in seen:
+            continue
+        speakers_payload.append(
+            {
+                "speaker_id": speaker_id,
+                "name": speaker_id,
+                "count": stats.get("total_statements", 0) or 0,
+                "duration": 0.0,
+                "topic_avg": stats.get("avg_topic_relevance", 0.0) or 0.0,
+                "novelty_avg": stats.get("avg_novelty", 0.0) or 0.0,
+                "participation": 0.0,
+            }
+        )
+
+    speakers_payload.sort(key=lambda item: item["speaker_id"])
+    return speakers_payload
+
+
+def broadcast_stats_messages() -> None:
+    overall_stats = meeting_stats.overall_dict()
+    speaker_stats = meeting_stats.speaker_dict()
+
+    enqueue_event(
+        {
+            "type": "stats_update",
+            "overall_stats": overall_stats,
+            "speaker_stats": speaker_stats,
+        }
+    )
+
+    enqueue_event(
+        {
+            "type": "stats",
+            "avg_topic": overall_stats.get("avg_topic_relevance", 0.0) or 0.0,
+            "avg_novelty": overall_stats.get("avg_novelty", 0.0) or 0.0,
+            "speakers": build_speaker_stats_payload(overall_stats, speaker_stats),
+        }
+    )
+
+
+def handle_transcription(segment: TranscribedSegment) -> None:
+    cleaned = segment.text.strip()
     if not cleaned or not meeting_state.is_active:
         return
+    meeting_state.speaker_id = segment.speaker_id
+    # Deduplicate bursts due to overlapping stride/ASR repeat
+    global _last_transcription_text, _last_transcription_speaker, _last_transcription_ts
+    now_ts = time.time()
+    if (
+        _last_transcription_text == cleaned
+        and _last_transcription_speaker == segment.speaker_id
+        and (now_ts - _last_transcription_ts) < 1.5
+    ):
+        return
+    _last_transcription_text = cleaned
+    _last_transcription_speaker = segment.speaker_id
+    _last_transcription_ts = now_ts
     logger.debug("새 전사: %s", cleaned)
     enqueue_event(
         {
             "type": "transcription",
             "text": cleaned,
-            "speaker_id": meeting_state.speaker_id,
-            "timestamp": datetime.now().isoformat(),
+            "speaker_id": segment.speaker_id,
+            "speaker_name": segment.speaker_name,
+            "similarity": segment.similarity,
+            "duration": segment.duration,
+            "timestamp": segment.end_time.isoformat(),
         }
     )
-    schedule_evaluation(cleaned)
+    schedule_evaluation(segment)
+    latest_segment = transcription_service.timeline_latest()
+    if latest_segment:
+        enqueue_event(
+            {
+                "type": "timeline_segment",
+                "segment": latest_segment,
+            }
+        )
 
 
-def schedule_evaluation(text: str) -> None:
+def schedule_evaluation(segment: TranscribedSegment) -> None:
     loop: Optional[asyncio.AbstractEventLoop] = getattr(app.state, "event_loop", None)
     queue_: Optional[asyncio.Queue] = getattr(app.state, "evaluation_queue", None)
     if loop is None or queue_ is None:
         logger.warning("평가 큐가 준비되지 않았습니다")
         return
     payload = {
-        "text": text,
-        "speaker_id": meeting_state.speaker_id,
+        "text": segment.text.strip(),
+        "speaker_id": segment.speaker_id,
+        "speaker_name": segment.speaker_name,
+        "duration": segment.duration,
+        "timestamp": segment.end_time.isoformat(),
         "session_id": meeting_state.session_id,
     }
     asyncio.run_coroutine_threadsafe(queue_.put(payload), loop)
@@ -656,17 +1079,19 @@ async def _evaluation_worker() -> None:
         try:
             await loop.run_in_executor(
                 None,
-                lambda t=task: _evaluate_and_broadcast(
-                    t.get("text", ""),
-                    t.get("speaker_id", "Speaker 1"),
-                    t.get("session_id"),
-                ),
+                lambda t=task: _evaluate_and_broadcast(t),
             )
         finally:
             queue_.task_done()
 
 
-def _evaluate_and_broadcast(text: str, speaker_id: str, session_id: Optional[str]) -> None:
+def _evaluate_and_broadcast(task: Dict[str, Any]) -> None:
+    text = task.get("text", "")
+    speaker_id = task.get("speaker_id", "Speaker 1")
+    session_id = task.get("session_id")
+    speaker_name = task.get("speaker_name", speaker_id)
+    duration = float(task.get("duration", 0.0) or 0.0)
+    timestamp_str = task.get("timestamp")
     if not text or session_id is None:
         return
     if not meeting_state.is_active or meeting_state.session_id != session_id:
@@ -675,7 +1100,7 @@ def _evaluate_and_broadcast(text: str, speaker_id: str, session_id: Optional[str
         result = ollama_evaluator.evaluate(text, speaker_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("평가 실패: %s", exc)
-        result = {"topic_relevance": 5.0, "novelty": 5.0}
+        result = {"topic_relevance": 5.0, "novelty": 5.0, "comment": ""}
 
     meeting_stats.add_statement(speaker_id, result["topic_relevance"], result["novelty"])
     with meeting_history_lock:
@@ -683,9 +1108,12 @@ def _evaluate_and_broadcast(text: str, speaker_id: str, session_id: Optional[str
             {
                 "text": text,
                 "speaker_id": speaker_id,
+                "speaker_name": speaker_name,
+                "duration": duration,
                 "topic_relevance": result["topic_relevance"],
                 "novelty": result["novelty"],
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": timestamp_str or datetime.now().isoformat(),
+                "comment": result.get("comment", ""),
             }
         )
 
@@ -693,19 +1121,16 @@ def _evaluate_and_broadcast(text: str, speaker_id: str, session_id: Optional[str
         {
             "type": "evaluation",
             "speaker_id": speaker_id,
+            "speaker_name": speaker_name,
+            "text": text,
             "topic_relevance": result["topic_relevance"],
             "novelty": result["novelty"],
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timestamp_str or datetime.now().isoformat(),
+            "comment": result.get("comment", ""),
         }
     )
 
-    enqueue_event(
-        {
-            "type": "stats_update",
-            "overall_stats": meeting_stats.overall_dict(),
-            "speaker_stats": meeting_stats.speaker_dict(),
-        }
-    )
+    broadcast_stats_messages()
 
 
 def _extract_json_object(response_text: str) -> Optional[Dict[str, Any]]:
@@ -1300,6 +1725,24 @@ async def health_check() -> Dict[str, Any]:
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
+@app.get("/api/speakers")
+async def get_speakers() -> Dict[str, Any]:
+    return {
+        "is_active": meeting_state.is_active,
+        "speakers": transcription_service.speaker_summaries(),
+        "stats": meeting_stats.speaker_dict(),
+        "stats_overall": meeting_stats.overall_dict(),
+    }
+
+
+@app.get("/api/timeline")
+async def get_timeline() -> Dict[str, Any]:
+    return {
+        "is_active": meeting_state.is_active,
+        "segments": transcription_service.timeline_snapshot(),
+    }
+
+
 @app.post("/api/start")
 async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     if meeting_state.is_active:
@@ -1312,6 +1755,7 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     session_id = str(uuid.uuid4())[:8]
     meeting_state.session_id = session_id
+    meeting_state.last_session_id = session_id
     meeting_state.topic = topic
     meeting_state.speaker_id = speaker_id
 
@@ -1329,6 +1773,7 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
         await loop.run_in_executor(None, lambda: transcription_service.start(handle_transcription))
     except Exception as exc:  # noqa: BLE001
         meeting_state.session_id = None
+        meeting_state.last_session_id = None
         meeting_state.topic = ""
         meeting_state.speaker_id = "Speaker 1"
         logger.exception("Whisper 전사 시작 실패: %s", exc)
@@ -1336,13 +1781,7 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     meeting_state.is_active = True
     broadcast_session_status()
-    enqueue_event(
-        {
-            "type": "stats_update",
-            "overall_stats": meeting_stats.overall_dict(),
-            "speaker_stats": meeting_stats.speaker_dict(),
-        }
-    )
+    broadcast_stats_messages()
     logger.info("회의 세션 시작: %s (주제=%s)", session_id, topic)
 
     return {"success": True, "session_id": session_id, "topic": topic}
@@ -1350,8 +1789,15 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/api/stop/{session_id}")
 async def stop_meeting(session_id: str) -> Dict[str, Any]:
-    if not meeting_state.is_active or meeting_state.session_id != session_id:
+    if not meeting_state.is_active:
+        if session_id == meeting_state.last_session_id:
+            return {"success": True, "message": "회의가 이미 종료되었습니다."}
         raise HTTPException(status_code=400, detail="진행 중인 세션이 없습니다")
+
+    if meeting_state.session_id != session_id:
+        if session_id == meeting_state.last_session_id:
+            return {"success": True, "message": "회의가 이미 종료되었습니다."}
+        raise HTTPException(status_code=400, detail="세션 ID가 일치하지 않습니다")
 
     loop = asyncio.get_running_loop()
     session_id_current = meeting_state.session_id
@@ -1381,8 +1827,10 @@ async def stop_meeting(session_id: str) -> Dict[str, Any]:
         ),
     )
 
+    broadcast_stats_messages()
     logger.info("회의 세션 종료: %s", session_id)
 
+    meeting_state.last_session_id = session_id_current
     meeting_state.session_id = None
     meeting_state.topic = ""
     meeting_state.speaker_id = "Speaker 1"
