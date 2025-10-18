@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button } from './ui/button';
 import { Progress } from './ui/progress';
 import { ChevronLeft, ChevronRight } from 'lucide-react';

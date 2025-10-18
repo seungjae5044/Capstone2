@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Header } from './components/Header';
 import { RealtimeSpeech } from './components/RealtimeSpeech';
 import { Statistics } from './components/Statistics';

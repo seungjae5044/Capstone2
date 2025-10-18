@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState ,useRef} from 'react';
 import { AudioVisualizer } from './AudioVisualizer';
 import type { TranscriptionEntry } from '../types';
+import * as ScrollAreaPrimitive from "@radix-ui/react-scroll-area";
 
 const SPEAKER_COLORS = ['#FF4444', '#44FF44', '#4444FF', '#FFFF44', '#FF44FF', '#44FFFF', '#FF8844', '#FF009D', '#8844FF', '#FFAA44'];
 
@@ -80,10 +81,11 @@ export function RealtimeSpeech({ isActive, transcriptions, speakerColors }: Real
       <AudioVisualizer isActive={isActive} />
 
       <div className="flex-1 flex flex-col min-h-0">
-        <div
+      <ScrollAreaPrimitive.Root style={{ height: 400 }}>
+      <ScrollAreaPrimitive.Viewport
           ref={scrollRef}
           onScroll={onScroll}
-          className="flex-1 overflow-y-auto space-y-2 pr-2 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent hover:scrollbar-thumb-gray-400"
+          className="h-full w-full pr-2 space-y-2"
         >
           {transcriptions.map((entry) => (
             <div
@@ -121,7 +123,10 @@ export function RealtimeSpeech({ isActive, transcriptions, speakerColors }: Real
               {isActive ? '발언을 분석하고 있습니다...' : '회의를 시작하면 실시간 발언이 표시됩니다.'}
             </div>
           )}
-        </div>
+        </ScrollAreaPrimitive.Viewport>
+        <ScrollAreaPrimitive.Scrollbar orientation="vertical" />
+        <ScrollAreaPrimitive.Corner />
+      </ScrollAreaPrimitive.Root>
       </div>
 
       <div className="border-t border-[#e5e7eb] pt-3 text-right mt-4">

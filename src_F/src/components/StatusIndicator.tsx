@@ -1,3 +1,4 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 interface StatusIndicatorProps {
   isActive: boolean;
   currentSpeaker?: string;
