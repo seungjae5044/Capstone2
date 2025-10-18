@@ -293,7 +293,7 @@ export default function App() {
       {/* main 태그를 flex-1로 만들어 Header를 제외한 나머지 공간을 모두 차지하게 합니다. */}
       <main className="max-w-7xl w-full mx-auto px-6 py-6 flex-1 flex flex-col min-h-0">
         {/* RealtimeSpeech와 Statistics를 담는 grid가 남은 공간을 채우도록 flex-1을 추가합니다. */}
-        <div className="grid grid-cols-12 gap-6 mb-6 flex-1 min-h-0">
+        <div className="grid grid-cols-12 gap-6 h-[500px] mb-6">
           <div className="col-span-6 min-h-0">
             <RealtimeSpeech
               isActive={isActive}

@@ -70,7 +70,7 @@ export function RealtimeSpeech({ isActive, transcriptions, speakerColors }: Real
   return (
     <div className="bg-white border border-[#e5e7eb] rounded-xl p-6 h-full min-h-0 flex flex-col relative max-h-[600px]">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold">실시간 발언</h2>
+        <h2>실시간 발언</h2>
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse' : 'bg-gray-300'}`} />
           <span className="text-sm text-[#6b7280]">{isActive ? '녹화 중' : '대기 중'}</span>
@@ -83,7 +83,7 @@ export function RealtimeSpeech({ isActive, transcriptions, speakerColors }: Real
         <div
           ref={scrollRef}
           onScroll={onScroll}
-          className="flex-1 overflow-y-auto space-y-2 pr-2 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent"
+          className="flex-1 overflow-y-auto space-y-2 pr-2 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent hover:scrollbar-thumb-gray-400"
         >
           {transcriptions.map((entry) => (
             <div
@@ -94,7 +94,7 @@ export function RealtimeSpeech({ isActive, transcriptions, speakerColors }: Real
               }}
             >
               <div className="flex items-center justify-between mb-1">
-                <span className="text-sm font-medium">{entry.speakerName}</span>
+                <span className="text-sm">{entry.speakerName}</span>
                 <span className="text-xs text-[#6b7280]">{formatTimestamp(entry.timestamp)}</span>
               </div>
               <p className="text-sm text-[#1a1a1a] mb-2">{entry.text}</p>
