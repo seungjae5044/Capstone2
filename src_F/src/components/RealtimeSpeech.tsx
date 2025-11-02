@@ -35,13 +35,23 @@ export function RealtimeSpeech({ isActive, transcriptions, speakerColors }: Real
 
   const colorMap = useMemo(() => speakerColors, [speakerColors]);
 
-  const formatTimestamp = (timestamp: string) => {
-    const date = new Date(timestamp);
-    if (Number.isNaN(date.getTime())) {
-      return '';
-    }
-    return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
-  };
+  const meetingStartTime = useMemo(() => {
+  if (transcriptions.length === 0) return null;
+  return new Date(transcriptions[0].timestamp).getTime();
+}, [transcriptions]);
+
+const formatTimestamp = (timestamp: string) => {
+  if (!meetingStartTime) return '00:00:00';
+  
+  const currentTime = new Date(timestamp).getTime();
+  const elapsedSeconds = Math.floor((currentTime - meetingStartTime) / 1000);
+  
+  const h = Math.floor(elapsedSeconds / 3600);
+  const m = Math.floor((elapsedSeconds % 3600) / 60);
+  const s = elapsedSeconds % 60;
+  
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
 
   // Auto-scroll to bottom when new items arrive and user is already at bottom
   useEffect(() => {
