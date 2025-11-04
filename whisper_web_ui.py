@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import time
 from math import gcd
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -27,6 +27,7 @@ import sounddevice as sd
 import torch
 from scipy.signal import resample_poly
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from pydantic import BaseModel
 
 try:
     from reportlab.lib import colors
@@ -437,6 +438,10 @@ class TranscriptionService:
         self.speakers = SpeakerHandler()
         self.timeline = TimelineManager()
 
+        # Input source configuration
+        self.input_source: Literal["mic", "system"] = "mic"
+        self.input_device_index: Optional[int] = None
+
     def initialize(self) -> None:
         """Whisper 파이프라인을 초기화한다."""
 
@@ -570,11 +575,13 @@ class TranscriptionService:
                 pass
 
         try:
+            channels = 2 if self.input_source == "system" else 1
             with sd.InputStream(
                 samplerate=self.config.audio_source_sr,
                 blocksize=blocksize,
-                channels=1,
+                channels=channels,
                 dtype="float32",
+                device=self.input_device_index,
                 callback=audio_callback,
             ):
                 logger.info("마이크 입력을 통한 전사를 시작합니다")
@@ -590,7 +597,11 @@ class TranscriptionService:
                     if chunk.size == 0:
                         continue
                     if chunk.ndim > 1:
-                        chunk = chunk[:, 0]
+                        # 스테레오 입력의 경우 모노로 다운믹스
+                        try:
+                            chunk = chunk.mean(axis=1)
+                        except Exception:  # noqa: BLE001
+                            chunk = chunk[:, 0]
 
                     resampled_chunk = resample_poly(
                         chunk,
@@ -678,6 +689,8 @@ class MeetingState:
     topic: str = ""
     speaker_id: str = "Speaker 1"
     is_active: bool = False
+    participants: int = 0
+    source: str = "mic"
 
 
 meeting_state = MeetingState()
@@ -942,6 +955,8 @@ def broadcast_session_status() -> None:
             "is_active": meeting_state.is_active,
             "session_id": meeting_state.session_id,
             "topic": meeting_state.topic,
+            "participants": meeting_state.participants,
+            "source": meeting_state.source,
         }
     )
 
@@ -1743,6 +1758,54 @@ async def get_timeline() -> Dict[str, Any]:
     }
 
 
+def _auto_pick_system_device_index() -> Optional[int]:
+    """Best-effort auto-pick of a loopback device on macOS.
+
+    Prefers device names containing BlackHole/Loopback/Soundflower.
+    """
+    try:
+        devices = sd.query_devices()
+    except Exception:  # noqa: BLE001
+        return None
+    prefer = ("BlackHole", "Loopback", "Soundflower")
+    for i, d in enumerate(devices):
+        try:
+            name = (d.get("name") or "")
+            max_in = int(d.get("max_input_channels") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if max_in > 0 and any(p.lower() in name.lower() for p in prefer):
+            return i
+    return None
+
+
+@app.get("/audio/devices")
+def list_audio_devices() -> Dict[str, Any]:
+    """Enumerate input-capable audio devices.
+
+    Returns empty list if sounddevice is unavailable.
+    """
+    try:
+        devs = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:  # noqa: BLE001
+        return {"devices": []}
+    devices: List[Dict[str, Any]] = []
+    for idx, d in enumerate(devs):
+        try:
+            devices.append(
+                {
+                    "index": idx,
+                    "name": d["name"],
+                    "max_input_channels": d["max_input_channels"],
+                    "hostapi": hostapis[d["hostapi"]]["name"],
+                }
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return {"devices": devices}
+
+
 @app.post("/api/start")
 async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     if meeting_state.is_active:
@@ -1750,6 +1813,13 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     topic = (payload.get("topic") or "").strip()
     speaker_id = (payload.get("speaker_id") or "Speaker 1").strip() or "Speaker 1"
+    participants = int(payload.get("participants") or 0)
+    source = (payload.get("source") or "mic").strip() or "mic"
+    device_index = payload.get("device_index")
+    try:
+        device_index_int: Optional[int] = int(device_index) if device_index is not None else None
+    except (TypeError, ValueError):
+        device_index_int = None
     if not topic:
         raise HTTPException(status_code=400, detail="회의 주제를 입력하세요")
 
@@ -1758,6 +1828,8 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     meeting_state.last_session_id = session_id
     meeting_state.topic = topic
     meeting_state.speaker_id = speaker_id
+    meeting_state.participants = participants
+    meeting_state.source = source
 
     meeting_stats.reset()
     ollama_evaluator.initialize(topic)
@@ -1770,12 +1842,19 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, transcription_service.initialize)
+        # Configure input source
+        transcription_service.input_source = "system" if source == "system" else "mic"
+        if transcription_service.input_source == "system" and device_index_int is None:
+            device_index_int = _auto_pick_system_device_index()
+        transcription_service.input_device_index = device_index_int
         await loop.run_in_executor(None, lambda: transcription_service.start(handle_transcription))
     except Exception as exc:  # noqa: BLE001
         meeting_state.session_id = None
         meeting_state.last_session_id = None
         meeting_state.topic = ""
         meeting_state.speaker_id = "Speaker 1"
+        meeting_state.participants = 0
+        meeting_state.source = "mic"
         logger.exception("Whisper 전사 시작 실패: %s", exc)
         raise HTTPException(status_code=500, detail="전사 시작에 실패했습니다. 로그를 확인하세요.")
 
@@ -1785,6 +1864,23 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("회의 세션 시작: %s (주제=%s)", session_id, topic)
 
     return {"success": True, "session_id": session_id, "topic": topic}
+
+
+@app.post("/start")
+async def start_meeting_simple(req: StartRequest) -> Dict[str, Any]:
+    """Compatibility alias for simplified start payload.
+
+    Forwards to /api/start with additional fields.
+    """
+    payload = {
+        "topic": req.topic,
+        "participants": req.participants,
+        "source": req.source,
+        "device_index": req.device_index,
+        # Keep default speaker id for backward compatibility
+        "speaker_id": "Speaker 1",
+    }
+    return await start_meeting(payload)
 
 
 @app.post("/api/stop/{session_id}")
@@ -1845,6 +1941,8 @@ async def get_status() -> Dict[str, Any]:
         "session_id": meeting_state.session_id,
         "topic": meeting_state.topic,
         "speaker_id": meeting_state.speaker_id,
+        "participants": meeting_state.participants,
+        "source": meeting_state.source,
     }
 
 
@@ -1877,3 +1975,10 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("whisper_web_ui:app", host="0.0.0.0", port=8000, reload=False)
+class StartRequest(BaseModel):
+    """Start meeting request payload."""
+
+    topic: str
+    participants: int
+    source: Literal["mic", "system"] = "mic"
+    device_index: Optional[int] = None

@@ -17,4 +17,6 @@ dependencies = [
     "torch>=2.9.0",
     "transformers>=4.57.1",
     "trl>=0.24.0",
+    "uvicorn>=0.38.0",
+    "websockets>=15.0.1",
 ]
