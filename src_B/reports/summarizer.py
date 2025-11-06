@@ -103,13 +103,13 @@ def create_summary_with_gemma(
         }
 
     recent_history = history[-40:]
-    history_lines = [
-        (
-            f"- {item['timestamp']} | {item['speaker_id']}: {item['text']}"
-            f" (주제 일치 {item['topic_relevance']:.1f}, 신규성 {item['novelty']:.1f})"
-        )
-        for item in recent_history
-    ]
+    history_lines = []
+    for item in recent_history:
+        line = f"- {item['timestamp']} | {item['speaker_id']}: {item['text']}"
+        # Add evaluation scores if available (only present when using Ollama evaluation)
+        if 'topic_relevance' in item and 'novelty' in item:
+            line += f" (주제 일치 {item['topic_relevance']:.1f}, 신규성 {item['novelty']:.1f})"
+        history_lines.append(line)
 
     prompt = (
         f"{GEMMA_SYSTEM_PROMPT}\n\n"
