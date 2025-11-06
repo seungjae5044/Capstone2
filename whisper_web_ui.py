@@ -11,15 +11,18 @@ import os
 import queue
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import time
 from math import gcd
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from collections import deque
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import requests
 import numpy as np
@@ -27,7 +30,8 @@ import sounddevice as sd
 import torch
 from scipy.signal import resample_poly
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from pydantic import BaseModel
+
+from diarization_service import MAX_SPEAKERS, DiarizationSegment, DiarizationService
 
 try:
     from reportlab.lib import colors
@@ -116,6 +120,60 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "repetition_penalty": 1.2,
     },
 }
+
+
+class RollingWaveform:
+    """오디오 파형을 일정 구간 유지하며 축약한다."""
+
+    def __init__(
+        self,
+        points_per_second: int = 20,
+        window_seconds: int = 120,
+    ) -> None:
+        self.points_per_second = points_per_second
+        self.window_seconds = window_seconds
+        self.max_points = max(1, points_per_second * window_seconds)
+        self.points: deque[float] = deque(maxlen=self.max_points)
+        self.samples_per_point: Optional[int] = None
+        self._remainder = np.zeros(0, dtype=np.float32)
+
+    def append_chunk(self, audio: np.ndarray, sample_rate: int) -> None:
+        if audio.size == 0:
+            return
+        if self.samples_per_point is None:
+            self.samples_per_point = max(1, int(sample_rate / self.points_per_second))
+        if self.samples_per_point <= 0:
+            self.samples_per_point = 1
+
+        if self._remainder.size:
+            audio = np.concatenate((self._remainder, audio))
+
+        full_points = audio.size // self.samples_per_point
+        if full_points:
+            trimmed = audio[: full_points * self.samples_per_point]
+            segments = trimmed.reshape(full_points, self.samples_per_point)
+            values = np.max(np.abs(segments), axis=1)
+            for value in values:
+                self.points.append(float(value))
+        self._remainder = audio[full_points * self.samples_per_point :]
+
+    def get_points(self) -> List[float]:
+        if not self.points:
+            return []
+        max_val = max(self.points)
+        if max_val <= 0.0:
+            return [0.0 for _ in self.points]
+        return [value / max_val for value in self.points]
+
+    def window_duration(self) -> float:
+        if not self.points:
+            return 0.0
+        return min(len(self.points), self.max_points) / self.points_per_second
+
+    def reset(self) -> None:
+        self.points.clear()
+        self.samples_per_point = None
+        self._remainder = np.zeros(0, dtype=np.float32)
 
 
 def deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -438,10 +496,6 @@ class TranscriptionService:
         self.speakers = SpeakerHandler()
         self.timeline = TimelineManager()
 
-        # Input source configuration
-        self.input_source: Literal["mic", "system"] = "mic"
-        self.input_device_index: Optional[int] = None
-
     def initialize(self) -> None:
         """Whisper 파이프라인을 초기화한다."""
 
@@ -508,6 +562,8 @@ class TranscriptionService:
         self.stop_event.clear()
         self.reset_state()
         self.audio_queue = queue.Queue(maxsize=self.config.queue_maxsize if self.config else 100)
+        self.waveform_buffer.reset()
+        self.last_waveform_emit = 0.0
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         logger.info("실시간 전사 스레드 시작")
@@ -525,6 +581,8 @@ class TranscriptionService:
             self.thread.join(timeout=2.0)
         self.thread = None
         self.audio_queue = None
+        self.waveform_buffer.reset()
+        self.last_waveform_emit = 0.0
         logger.info("실시간 전사 스레드 종료")
 
     def speaker_summaries(self) -> List[Dict[str, Any]]:
@@ -575,13 +633,11 @@ class TranscriptionService:
                 pass
 
         try:
-            channels = 2 if self.input_source == "system" else 1
             with sd.InputStream(
                 samplerate=self.config.audio_source_sr,
                 blocksize=blocksize,
-                channels=channels,
+                channels=1,
                 dtype="float32",
-                device=self.input_device_index,
                 callback=audio_callback,
             ):
                 logger.info("마이크 입력을 통한 전사를 시작합니다")
@@ -597,17 +653,28 @@ class TranscriptionService:
                     if chunk.size == 0:
                         continue
                     if chunk.ndim > 1:
-                        # 스테레오 입력의 경우 모노로 다운믹스
-                        try:
-                            chunk = chunk.mean(axis=1)
-                        except Exception:  # noqa: BLE001
-                            chunk = chunk[:, 0]
+                        chunk = chunk[:, 0]
 
                     resampled_chunk = resample_poly(
                         chunk,
                         up=self.resample_up,
                         down=self.resample_down,
                     )
+                    if self.diarization_service:
+                        self.diarization_service.add_audio(resampled_chunk, target_sr)
+                    self.waveform_buffer.append_chunk(resampled_chunk, target_sr)
+                    now = time.time()
+                    if now - self.last_waveform_emit >= self.waveform_emit_interval:
+                        points = self.waveform_buffer.get_points()
+                        if points:
+                            enqueue_event(
+                                {
+                                    "type": "waveform",
+                                    "points": points,
+                                    "window_seconds": self.waveform_buffer.window_duration(),
+                                }
+                            )
+                        self.last_waveform_emit = now
                     full_audio_buffer.append(resampled_chunk)
 
                     total_samples = sum(len(buf) for buf in full_audio_buffer)
@@ -680,6 +747,7 @@ class TranscriptionService:
 
 CONFIG_PATH = Path("config_whisper.json")
 transcription_service = TranscriptionService(CONFIG_PATH)
+diarization_service: Optional[DiarizationService] = None
 
 
 @dataclass
@@ -689,11 +757,13 @@ class MeetingState:
     topic: str = ""
     speaker_id: str = "Speaker 1"
     is_active: bool = False
-    participants: int = 0
-    source: str = "mic"
+    expected_speakers: int = 2
 
 
 meeting_state = MeetingState()
+
+
+meeting_state_lock = threading.Lock()
 
 
 @dataclass
@@ -949,16 +1019,16 @@ def enqueue_event(message: Dict[str, Any]) -> None:
 
 
 def broadcast_session_status() -> None:
-    enqueue_event(
-        {
+    with meeting_state_lock:
+        payload = {
             "type": "session_status",
             "is_active": meeting_state.is_active,
             "session_id": meeting_state.session_id,
             "topic": meeting_state.topic,
-            "participants": meeting_state.participants,
-            "source": meeting_state.source,
+            "expected_speakers": meeting_state.expected_speakers,
+            "speaker_id": meeting_state.speaker_id,
         }
-    )
+    enqueue_event(payload)
 
 
 def build_speaker_stats_payload(
@@ -1084,6 +1154,58 @@ def schedule_evaluation(segment: TranscribedSegment) -> None:
         "session_id": meeting_state.session_id,
     }
     asyncio.run_coroutine_threadsafe(queue_.put(payload), loop)
+
+
+def ensure_diarization_service(device: str, max_speakers: int) -> DiarizationService:
+    """선택한 장치와 화자 수 설정에 맞는 다이어리제이션 서비스를 준비한다."""
+
+    global diarization_service
+    target_speakers = max(1, min(int(max_speakers), MAX_SPEAKERS))
+    if diarization_service:
+        same_device = diarization_service.encoder.device == device
+        same_limit = getattr(diarization_service, "max_speakers", MAX_SPEAKERS) == target_speakers
+        if same_device and same_limit:
+            return diarization_service
+        diarization_service.stop()
+    diarization_service = DiarizationService(device=device, max_speakers=target_speakers)
+    return diarization_service
+
+
+def handle_diarization_segment(segment: DiarizationSegment) -> None:
+    if not meeting_state.is_active:
+        return
+    service = diarization_service
+    offset = 0.0
+    if service is not None:
+        offset = max(0.0, segment.start_time - service.timeline_start)
+    duration = max(0.0, segment.end_time - segment.start_time)
+    enqueue_event(
+        {
+            "type": "diarization",
+            "speaker_id": segment.speaker_label,
+            "is_pending": segment.is_pending,
+            "similarity": round(float(segment.similarity), 3),
+            "offset": offset,
+            "duration": duration,
+        }
+    )
+
+
+def update_active_speaker(speaker_label: str) -> None:
+    with meeting_state_lock:
+        if not meeting_state.is_active:
+            return
+        previous = meeting_state.speaker_id
+        meeting_state.speaker_id = speaker_label
+    if speaker_label == previous or speaker_label == "Pending":
+        return
+    enqueue_event(
+        {
+            "type": "active_speaker",
+            "speaker_id": speaker_label,
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
 
 
 async def _evaluation_worker() -> None:
@@ -1444,28 +1566,37 @@ def get_dashboard_html() -> str:
 <body class="bg-gray-100">
     <div class="container mx-auto p-4">
         <header class="bg-white rounded-lg shadow-md p-6 mb-6">
-            <h1 class="text-3xl font-bold text-gray-800 mb-2">🎯 MeetingProgram</h1>
-            <p class="text-gray-600">실시간 회의 평가 시스템 (Whisper + Gemma 1B)</p>
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
+                <div>
+                    <h1 class="text-3xl font-bold text-gray-800 mb-2">🎯 MeetingProgram</h1>
+                    <p class="text-gray-600">실시간 회의 평가 시스템 (Whisper + Gemma 1B)</p>
+                </div>
+                <div class="w-full md:w-auto">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+                        <input type="text" id="meetingTopic" placeholder="회의 주제" class="p-2 border rounded" required>
+                        <input type="number" id="expectedSpeakers" min="1" max="10" value="2" class="p-2 border rounded" placeholder="예상 화자 수">
+                        <input type="hidden" id="initialSpeaker" value="Speaker 1">
+                    </div>
+                    <div class="flex flex-wrap gap-3">
+                        <button id="startBtn" class="bg-green-500 hover:bg-green-600 text-white px-6 py-2 rounded">
+                            🎤 회의 시작
+                        </button>
+                        <button id="stopBtn" class="bg-red-500 hover:bg-red-600 text-white px-6 py-2 rounded" disabled>
+                            ⏹️ 회의 중지
+                        </button>
+                        <button id="reportBtn" class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-2 rounded" disabled>
+                            📄 보고서 다운로드
+                        </button>
+                    </div>
+                </div>
+            </div>
         </header>
 
         <div class="bg-white rounded-lg shadow-md p-6 mb-6">
-            <h2 class="text-xl font-semibold mb-4">회의 제어</h2>
-            <div class="flex flex-col md:flex-row md:space-x-4 mb-4 space-y-2 md:space-y-0">
-                <input type="text" id="meetingTopic" placeholder="회의 주제" class="flex-1 p-2 border rounded" required>
-                <select id="speakerId" class="w-48 p-2 border rounded">
-                    <option value="Speaker 1">Speaker 1</option>
-                </select>
-            </div>
-            <div class="flex flex-wrap gap-4">
-                <button id="startBtn" class="bg-green-500 hover:bg-green-600 text-white px-6 py-2 rounded">
-                    🎤 회의 시작
-                </button>
-                <button id="stopBtn" class="bg-red-500 hover:bg-red-600 text-white px-6 py-2 rounded" disabled>
-                    ⏹️ 회의 중지
-                </button>
-                <button id="reportBtn" class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-2 rounded" disabled>
-                    📄 보고서 다운로드
-                </button>
+            <h2 class="text-xl font-semibold mb-4">음성 타임라인</h2>
+            <div class="space-y-4">
+                <canvas id="waveformCanvas" class="w-full h-40 rounded bg-gray-100"></canvas>
+                <canvas id="speakerCanvas" class="w-full h-20 rounded bg-gray-100"></canvas>
             </div>
         </div>
 
@@ -1528,9 +1659,187 @@ def get_dashboard_html() -> str:
         let isConnected = false;
         let currentSession = null;
 
+        const waveformCanvas = document.getElementById('waveformCanvas');
+        const speakerCanvas = document.getElementById('speakerCanvas');
+        let waveformPoints = [];
+        let waveformWindowSeconds = 0;
+        let speakerSegments = [];
+        const timelineWindowSeconds = 120;
+        const speakerPalette = ['#2563eb', '#ef4444', '#10b981', '#f97316', '#8b5cf6', '#ec4899', '#22d3ee', '#f59e0b'];
+        const speakerColors = { Pending: '#9ca3af', '대기 중': '#9ca3af' };
+        let speakerPaletteIndex = 0;
+
+        window.addEventListener('resize', () => {
+            drawWaveform();
+            drawSpeakerTimeline();
+        });
+
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
         const reportBtn = document.getElementById('reportBtn');
+
+        function getSpeakerColor(label) {
+            if (!label) {
+                return '#2563eb';
+            }
+            if (!speakerColors[label]) {
+                const color = speakerPalette[speakerPaletteIndex % speakerPalette.length];
+                speakerColors[label] = color;
+                speakerPaletteIndex += 1;
+            }
+            return speakerColors[label];
+        }
+
+        function prepareCanvas(canvas) {
+            if (!canvas) return null;
+            const width = canvas.clientWidth || canvas.parentElement.clientWidth || 0;
+            const height = canvas.clientHeight || 0;
+            const ratio = window.devicePixelRatio || 1;
+            const scaledWidth = Math.max(1, Math.floor(width * ratio));
+            const scaledHeight = Math.max(1, Math.floor(height * ratio));
+            if (canvas.width !== scaledWidth || canvas.height !== scaledHeight) {
+                canvas.width = scaledWidth;
+                canvas.height = scaledHeight;
+            }
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+            return { ctx, width, height };
+        }
+
+        function drawWaveform() {
+            if (!waveformCanvas) return;
+            const prepared = prepareCanvas(waveformCanvas);
+            if (!prepared) return;
+            const { ctx, width, height } = prepared;
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = '#e5e7eb';
+            ctx.fillRect(0, 0, width, height);
+
+            if (!waveformPoints.length) {
+                ctx.fillStyle = '#6b7280';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('오디오 파형 대기 중', width / 2, height / 2);
+                return;
+            }
+
+            const mid = height / 2;
+            ctx.strokeStyle = '#1d4ed8';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let i = 0; i < waveformPoints.length; i += 1) {
+                const x = (i / (waveformPoints.length - 1)) * width;
+                const amplitude = waveformPoints[i];
+                const y1 = mid - amplitude * (mid - 2);
+                const y2 = mid + amplitude * (mid - 2);
+                ctx.moveTo(x, y1);
+                ctx.lineTo(x, y2);
+            }
+            ctx.stroke();
+
+            ctx.strokeStyle = '#94a3b8';
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(0, mid);
+            ctx.lineTo(width, mid);
+            ctx.stroke();
+        }
+
+        function drawSpeakerTimeline() {
+            if (!speakerCanvas) return;
+            const prepared = prepareCanvas(speakerCanvas);
+            if (!prepared) return;
+            const { ctx, width, height } = prepared;
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = '#e5e7eb';
+            ctx.fillRect(0, 0, width, height);
+
+            if (!speakerSegments.length) {
+                ctx.fillStyle = '#6b7280';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('화자 데이터 대기 중', width / 2, height / 2);
+                return;
+            }
+
+            let latestEnd = 0;
+            speakerSegments.forEach((seg) => {
+                latestEnd = Math.max(latestEnd, seg.start + seg.duration);
+            });
+            const activeWindow = Math.max(10, waveformWindowSeconds || timelineWindowSeconds);
+            const windowStart = Math.max(0, latestEnd - activeWindow);
+            const windowEnd = windowStart + activeWindow;
+            const barHeight = Math.max(6, height * 0.5);
+            const barTop = (height - barHeight) / 2;
+
+            ctx.fillStyle = '#d1d5db';
+            ctx.fillRect(0, barTop, width, barHeight);
+
+            speakerSegments.forEach((seg) => {
+                const segStart = Math.max(seg.start, windowStart);
+                const segEnd = Math.min(seg.start + seg.duration, windowEnd);
+                if (segEnd <= segStart) {
+                    return;
+                }
+                const startX = ((segStart - windowStart) / activeWindow) * width;
+                const segmentWidth = Math.max(2, ((segEnd - segStart) / activeWindow) * width);
+                const color = seg.pending ? '#9ca3af' : getSpeakerColor(seg.label);
+                ctx.fillStyle = color;
+                ctx.fillRect(startX, barTop, segmentWidth, barHeight);
+                if (!seg.pending && segmentWidth > 40) {
+                    ctx.fillStyle = '#1f2937';
+                    ctx.font = '12px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(seg.label, startX + segmentWidth / 2, barTop + barHeight / 2);
+                }
+            });
+        }
+
+        function updateWaveform(data) {
+            waveformPoints = Array.isArray(data.points) ? data.points : [];
+            waveformWindowSeconds = typeof data.window_seconds === 'number' ? data.window_seconds : 0;
+            drawWaveform();
+            drawSpeakerTimeline();
+        }
+
+        function trimSpeakerSegments() {
+            if (!speakerSegments.length) return;
+            let latestEnd = 0;
+            speakerSegments.forEach((seg) => {
+                latestEnd = Math.max(latestEnd, seg.start + seg.duration);
+            });
+            const windowSize = Math.max(timelineWindowSeconds, waveformWindowSeconds || timelineWindowSeconds);
+            const cutoff = Math.max(0, latestEnd - windowSize);
+            speakerSegments = speakerSegments.filter((seg) => seg.start + seg.duration >= cutoff);
+        }
+
+        function handleDiarization(data) {
+            showCurrentSpeaker(data);
+            if (typeof data.offset !== 'number') {
+                drawSpeakerTimeline();
+                return;
+            }
+            const segment = {
+                start: Math.max(0, data.offset),
+                duration: Math.max(0, data.duration || 0),
+                label: data.speaker_id || 'Unknown',
+                pending: !!data.is_pending,
+            };
+            if (segment.duration <= 0) {
+                drawSpeakerTimeline();
+                return;
+            }
+            speakerSegments.push(segment);
+            trimSpeakerSegments();
+            drawSpeakerTimeline();
+        }
+
+        drawWaveform();
+        drawSpeakerTimeline();
 
         ws.onopen = () => { isConnected = true; };
         ws.onclose = () => { isConnected = false; };
@@ -1553,17 +1862,43 @@ def get_dashboard_html() -> str:
                 case 'report_ready':
                     updateReportStatus(data);
                     break;
+                case 'waveform':
+                    updateWaveform(data);
+                    break;
+                case 'diarization':
+                    handleDiarization(data);
+                    break;
             }
         }
 
         function updateSessionStatus(data) {
             const status = document.getElementById('status');
+            const expectedField = document.getElementById('expectedSpeakers');
+            const initialField = document.getElementById('initialSpeaker');
+            if (expectedField && typeof data.expected_speakers === 'number') {
+                expectedField.value = data.expected_speakers;
+            }
             if (data.is_active) {
+                if (data.session_id && data.session_id !== currentSession) {
+                    waveformPoints = [];
+                    speakerSegments = [];
+                    Object.keys(speakerColors).forEach((key) => {
+                        if (key !== 'Pending' && key !== '대기 중') {
+                            delete speakerColors[key];
+                        }
+                    });
+                    speakerPaletteIndex = 0;
+                    drawWaveform();
+                    drawSpeakerTimeline();
+                }
                 status.textContent = `🎤 회의 진행 중 (주제: ${data.topic})`;
                 status.className = 'text-green-600 font-semibold';
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
                 reportBtn.disabled = true;
+                if (initialField && typeof data.speaker_id === 'string') {
+                    initialField.value = data.speaker_id;
+                }
                 currentSession = data.session_id;
             } else {
                 status.textContent = '⏸️ 대기 중';
@@ -1571,6 +1906,19 @@ def get_dashboard_html() -> str:
                 startBtn.disabled = false;
                 stopBtn.disabled = true;
                 reportBtn.disabled = true;
+                waveformPoints = [];
+                speakerSegments = [];
+                Object.keys(speakerColors).forEach((key) => {
+                    if (key !== 'Pending' && key !== '대기 중') {
+                        delete speakerColors[key];
+                    }
+                });
+                speakerPaletteIndex = 0;
+                drawWaveform();
+                drawSpeakerTimeline();
+                if (initialField) {
+                    initialField.value = 'Speaker 1';
+                }
                 currentSession = null;
             }
         }
@@ -1585,17 +1933,43 @@ def get_dashboard_html() -> str:
             }
         }
 
+        function showCurrentSpeaker(data) {
+            const el = document.getElementById('currentSpeaker');
+            if (!el) return;
+            const label = data.speaker_id || 'Unknown';
+            const isPending = !!data.is_pending;
+            const similarity = typeof data.similarity === 'number' ? data.similarity : null;
+            const offset = typeof data.offset === 'number' ? data.offset : null;
+            const parts = [`현재 화자: ${label}`];
+            if (similarity !== null) {
+                parts.push(`유사도 ${similarity.toFixed(2)}`);
+            }
+            if (offset !== null) {
+                parts.push(`+${offset.toFixed(1)}초`);
+            }
+            parts.push(isPending ? '상태: 분류 중' : '상태: 확정');
+            el.textContent = parts.join(' | ');
+            el.className = 'mt-2 text-sm font-semibold';
+            el.style.color = isPending ? '#ca8a04' : getSpeakerColor(label);
+        }
+
         function addTranscription(data) {
             const feed = document.getElementById('transcriptionFeed');
             const item = document.createElement('div');
-            item.className = 'border-l-4 border-blue-400 pl-4 py-2';
+            const color = getSpeakerColor(data.speaker_id);
+            item.className = 'border-l-4 pl-4 py-2';
+            item.style.borderLeft = `4px solid ${color}`;
             item.innerHTML = `
                 <div class="flex justify-between">
-                    <span class="font-semibold text-blue-600">${data.speaker_id}</span>
+                    <span class="font-semibold speaker-label">${data.speaker_id}</span>
                     <span class="text-sm text-gray-500">${new Date().toLocaleTimeString()}</span>
                 </div>
                 <div class="mt-1">${data.text}</div>
             `;
+            const labelEl = item.querySelector('.speaker-label');
+            if (labelEl) {
+                labelEl.style.color = color;
+            }
 
             const firstElement = feed.firstElementChild;
             if (firstElement && firstElement.classList.contains('text-gray-500')) {
@@ -1648,7 +2022,11 @@ def get_dashboard_html() -> str:
 
         startBtn.addEventListener('click', async () => {
             const topic = document.getElementById('meetingTopic').value.trim();
-            const speakerId = document.getElementById('speakerId').value;
+            const speakerInput = document.getElementById('initialSpeaker');
+            const expectedInput = document.getElementById('expectedSpeakers');
+            const rawExpected = expectedInput ? parseInt(expectedInput.value, 10) : 2;
+            const expectedSpeakers = Math.min(Math.max(rawExpected || 2, 1), 10);
+            const initialSpeaker = speakerInput && speakerInput.value.trim() ? speakerInput.value.trim() : 'Speaker 1';
             if (!topic) {
                 alert('회의 주제를 입력하세요.');
                 return;
@@ -1656,7 +2034,7 @@ def get_dashboard_html() -> str:
             const response = await fetch('/api/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ topic, speaker_id: speakerId })
+                body: JSON.stringify({ topic, speaker_id: initialSpeaker, expected_speakers: expectedSpeakers })
             });
             if (!response.ok) {
                 const error = await response.json();
@@ -1758,54 +2136,6 @@ async def get_timeline() -> Dict[str, Any]:
     }
 
 
-def _auto_pick_system_device_index() -> Optional[int]:
-    """Best-effort auto-pick of a loopback device on macOS.
-
-    Prefers device names containing BlackHole/Loopback/Soundflower.
-    """
-    try:
-        devices = sd.query_devices()
-    except Exception:  # noqa: BLE001
-        return None
-    prefer = ("BlackHole", "Loopback", "Soundflower")
-    for i, d in enumerate(devices):
-        try:
-            name = (d.get("name") or "")
-            max_in = int(d.get("max_input_channels") or 0)
-        except Exception:  # noqa: BLE001
-            continue
-        if max_in > 0 and any(p.lower() in name.lower() for p in prefer):
-            return i
-    return None
-
-
-@app.get("/audio/devices")
-def list_audio_devices() -> Dict[str, Any]:
-    """Enumerate input-capable audio devices.
-
-    Returns empty list if sounddevice is unavailable.
-    """
-    try:
-        devs = sd.query_devices()
-        hostapis = sd.query_hostapis()
-    except Exception:  # noqa: BLE001
-        return {"devices": []}
-    devices: List[Dict[str, Any]] = []
-    for idx, d in enumerate(devs):
-        try:
-            devices.append(
-                {
-                    "index": idx,
-                    "name": d["name"],
-                    "max_input_channels": d["max_input_channels"],
-                    "hostapi": hostapis[d["hostapi"]]["name"],
-                }
-            )
-        except Exception:  # noqa: BLE001
-            continue
-    return {"devices": devices}
-
-
 @app.post("/api/start")
 async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     if meeting_state.is_active:
@@ -1813,13 +2143,12 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     topic = (payload.get("topic") or "").strip()
     speaker_id = (payload.get("speaker_id") or "Speaker 1").strip() or "Speaker 1"
-    participants = int(payload.get("participants") or 0)
-    source = (payload.get("source") or "mic").strip() or "mic"
-    device_index = payload.get("device_index")
+    expected_speakers_raw = payload.get("expected_speakers")
     try:
-        device_index_int: Optional[int] = int(device_index) if device_index is not None else None
+        expected_speakers = int(expected_speakers_raw)
     except (TypeError, ValueError):
-        device_index_int = None
+        expected_speakers = 2
+    expected_speakers = max(1, min(expected_speakers, MAX_SPEAKERS))
     if not topic:
         raise HTTPException(status_code=400, detail="회의 주제를 입력하세요")
 
@@ -1828,8 +2157,6 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     meeting_state.last_session_id = session_id
     meeting_state.topic = topic
     meeting_state.speaker_id = speaker_id
-    meeting_state.participants = participants
-    meeting_state.source = source
 
     meeting_stats.reset()
     ollama_evaluator.initialize(topic)
@@ -1840,47 +2167,36 @@ async def start_meeting(payload: Dict[str, Any]) -> Dict[str, Any]:
     last_summary_payload = None
 
     loop = asyncio.get_running_loop()
+    diar_service: Optional[DiarizationService] = None
     try:
         await loop.run_in_executor(None, transcription_service.initialize)
-        # Configure input source
-        transcription_service.input_source = "system" if source == "system" else "mic"
-        if transcription_service.input_source == "system" and device_index_int is None:
-            device_index_int = _auto_pick_system_device_index()
-        transcription_service.input_device_index = device_index_int
+        diar_service = await loop.run_in_executor(
+            None,
+            lambda: ensure_diarization_service(
+                transcription_service.device,
+                expected_speakers,
+            ),
+        )
+        diar_service.set_segment_callback(handle_diarization_segment)
+        diar_service.set_active_speaker_callback(update_active_speaker)
+        diar_service.start()
+        transcription_service.attach_diarization(diar_service)
         await loop.run_in_executor(None, lambda: transcription_service.start(handle_transcription))
     except Exception as exc:  # noqa: BLE001
         meeting_state.session_id = None
         meeting_state.last_session_id = None
         meeting_state.topic = ""
         meeting_state.speaker_id = "Speaker 1"
-        meeting_state.participants = 0
-        meeting_state.source = "mic"
         logger.exception("Whisper 전사 시작 실패: %s", exc)
         raise HTTPException(status_code=500, detail="전사 시작에 실패했습니다. 로그를 확인하세요.")
 
-    meeting_state.is_active = True
+    with meeting_state_lock:
+        meeting_state.is_active = True
     broadcast_session_status()
     broadcast_stats_messages()
     logger.info("회의 세션 시작: %s (주제=%s)", session_id, topic)
 
     return {"success": True, "session_id": session_id, "topic": topic}
-
-
-@app.post("/start")
-async def start_meeting_simple(req: StartRequest) -> Dict[str, Any]:
-    """Compatibility alias for simplified start payload.
-
-    Forwards to /api/start with additional fields.
-    """
-    payload = {
-        "topic": req.topic,
-        "participants": req.participants,
-        "source": req.source,
-        "device_index": req.device_index,
-        # Keep default speaker id for backward compatibility
-        "speaker_id": "Speaker 1",
-    }
-    return await start_meeting(payload)
 
 
 @app.post("/api/stop/{session_id}")
@@ -1909,8 +2225,31 @@ async def stop_meeting(session_id: str) -> Dict[str, Any]:
         logger.exception("전사 중지 실패: %s", exc)
         raise HTTPException(status_code=500, detail="전사 중지에 실패했습니다")
 
-    meeting_state.is_active = False
+    diar_service = diarization_service
+    if diar_service is not None:
+        await loop.run_in_executor(None, diar_service.stop)
+    transcription_service.attach_diarization(None)
+
+    with meeting_state_lock:
+        meeting_state.is_active = False
     broadcast_session_status()
+    enqueue_event(
+        {
+            "type": "diarization",
+            "speaker_id": "대기 중",
+            "is_pending": False,
+            "similarity": 0.0,
+            "offset": 0.0,
+            "duration": 0.0,
+        }
+    )
+    enqueue_event(
+        {
+            "type": "waveform",
+            "points": [],
+            "window_seconds": 0.0,
+        }
+    )
 
     await loop.run_in_executor(
         None,
@@ -1941,8 +2280,6 @@ async def get_status() -> Dict[str, Any]:
         "session_id": meeting_state.session_id,
         "topic": meeting_state.topic,
         "speaker_id": meeting_state.speaker_id,
-        "participants": meeting_state.participants,
-        "source": meeting_state.source,
     }
 
 
@@ -1975,10 +2312,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("whisper_web_ui:app", host="0.0.0.0", port=8000, reload=False)
-class StartRequest(BaseModel):
-    """Start meeting request payload."""
-
-    topic: str
-    participants: int
-    source: Literal["mic", "system"] = "mic"
-    device_index: Optional[int] = None
