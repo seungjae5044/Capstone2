@@ -116,3 +116,20 @@ export interface TimelineEntry {
   endTime: string;
   duration: number;
 }
+
+// Setup and audio device types
+export type AudioSource = 'mic' | 'system';
+
+export interface StartRequest {
+  topic: string;
+  participants: number;
+  source: AudioSource;
+  device_index?: number;
+}
+
+export interface AudioDeviceInfo {
+  index: number;
+  name: string;
+  max_input_channels: number;
+  hostapi: string;
+}
