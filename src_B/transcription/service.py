@@ -131,7 +131,7 @@ class TranscriptionService:
         # Optional callback for waveform visualization events
         self.waveform_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 
-    def initialize(self) -> None:
+    def initialize(self) -> bool:
         """
         Initialize the Whisper transcription pipeline.
 
@@ -142,59 +142,63 @@ class TranscriptionService:
         The initialization is thread-safe and will only execute once even if called
         multiple times concurrently.
 
-        Raises:
-            RuntimeError: If pipeline is already initialized
-            FileNotFoundError: If configuration file is not found
-            Exception: If model loading fails
+        Returns:
+            True if initialization successful, False otherwise
 
         Example:
             >>> service = TranscriptionService(Path("config_whisper.json"))
-            >>> service.initialize()
-            >>> print(f"Using device: {service.device}")
+            >>> if service.initialize():
+            ...     print(f"Using device: {service.device}")
             Using device: cuda
         """
-        with self.lock:
-            if self.pipeline is not None:
-                return
+        try:
+            with self.lock:
+                if self.pipeline is not None:
+                    return True
 
-            raw_config = load_config(self.config_path)
-            self.config = WhisperConfig(**raw_config)
+                raw_config = load_config(self.config_path)
+                self.config = WhisperConfig(**raw_config)
 
-            self.device, self.torch_dtype = select_device(self.config.force_device)
+                self.device, self.torch_dtype = select_device(self.config.force_device)
 
-            model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                self.config.model_id,
-                torch_dtype=self.torch_dtype,
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-            )
-            model.to(self.device)
-            processor = AutoProcessor.from_pretrained(self.config.model_id)
+                model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                    self.config.model_id,
+                    torch_dtype=self.torch_dtype,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True,
+                )
+                model.to(self.device)
+                processor = AutoProcessor.from_pretrained(self.config.model_id)
 
-            pipe_kwargs = {
-                "model": model,
-                "tokenizer": processor.tokenizer,
-                "feature_extractor": processor.feature_extractor,
-                "torch_dtype": self.torch_dtype,
-                "device": self.device,
-                "chunk_length_s": self.config.chunk_length_s,
-                "stride_length_s": (
-                    self.config.stride_seconds,
-                    self.config.stride_seconds,
-                ),
-                "return_timestamps": True,
-                "generate_kwargs": deep_update(
-                    json.loads(json.dumps(DEFAULT_CONFIG["generate_kwargs"])),
-                    self.config.generate_kwargs,
-                ),
-            }
-            self.pipeline = pipeline("automatic-speech-recognition", **pipe_kwargs)
+                pipe_kwargs = {
+                    "model": model,
+                    "tokenizer": processor.tokenizer,
+                    "feature_extractor": processor.feature_extractor,
+                    "torch_dtype": self.torch_dtype,
+                    "device": self.device,
+                    "chunk_length_s": self.config.chunk_length_s,
+                    "stride_length_s": (
+                        self.config.stride_seconds,
+                        self.config.stride_seconds,
+                    ),
+                    "return_timestamps": True,
+                    "generate_kwargs": deep_update(
+                        json.loads(json.dumps(DEFAULT_CONFIG["generate_kwargs"])),
+                        self.config.generate_kwargs,
+                    ),
+                }
+                self.pipeline = pipeline("automatic-speech-recognition", **pipe_kwargs)
 
-            factor = gcd(self.config.audio_source_sr, self.config.target_sr)
-            self.resample_up = self.config.target_sr // factor
-            self.resample_down = self.config.audio_source_sr // factor
+                factor = gcd(self.config.audio_source_sr, self.config.target_sr)
+                self.resample_up = self.config.target_sr // factor
+                self.resample_down = self.config.audio_source_sr // factor
 
-            logger.info("Whisper 파이프라인 초기화 완료 (device=%s)", self.device)
+                logger.info("Whisper 파이프라인 초기화 완료 (device=%s)", self.device)
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize transcription service: {e}", exc_info=True)
+            return False
 
     def is_running(self) -> bool:
         """
