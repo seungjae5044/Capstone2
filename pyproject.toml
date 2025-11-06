@@ -1,0 +1,20 @@
+[project]
+name = "capstone2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dataset>=1.6.2",
+    "fastapi>=0.120.1",
+    "numpy>=2.3.4",
+    "peft>=0.17.1",
+    "reportlab>=4.4.4",
+    "requests>=2.32.5",
+    "scipy>=1.16.2",
+    "sounddevice>=0.5.3",
+    "speechbrain>=1.0.3",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
+    "trl>=0.24.0",
+]

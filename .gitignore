@@ -1,0 +1,16 @@
+MeetingProgram/models/
+캡스톤(회의 평가)/
+캡스톤_최종/
+.claude/
+diart
+diart_fixed/
+llm/
+MeetingProgram/
+Utterr/
+*.pt
+*.onnx
+src_F/node_modules
+ollama
+output
+src_F/node_modules
+CLAUDE.md
