@@ -6,9 +6,10 @@ import logging
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Deque, Dict, Any, Optional
 
 from src_B.api.state import (
     meeting_state,
@@ -17,8 +18,6 @@ from src_B.api.state import (
     diarization_service,
     ollama_evaluator,
     ensure_diarization_service,
-    handle_transcription,
-    handle_diarization_segment,
 )
 from src_B.config.config import select_device
 from src_B.models.data_models import TranscribedSegment, DiarizationSegment
@@ -41,6 +40,8 @@ class TerminalInterface:
         self.running = False
         self.meeting_started = False
         self.device = None
+        self.meeting_history: Deque[Dict[str, Any]] = deque(maxlen=1000)
+        self.enable_evaluation = False  # Disable Ollama evaluation by default in terminal mode
 
     def setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
@@ -117,8 +118,9 @@ class TerminalInterface:
             meeting_state.is_active = True
             meeting_state.session_id = datetime.utcnow().isoformat()
 
-            # Reset statistics
+            # Reset statistics and history
             meeting_stats.reset()
+            self.meeting_history.clear()
 
             # Start transcription
             transcription_service.start(callback=self._handle_transcription)
@@ -174,14 +176,12 @@ class TerminalInterface:
             # Generate report
             logger.info("Generating meeting report...")
 
-            from src_B.api.state import meeting_history
-
             report_path, summary = finalize_meeting_report(
                 session_id=meeting_state.session_id or "unknown",
                 topic=meeting_state.topic,
                 overall_stats=meeting_stats.overall_dict(),
                 speaker_stats=meeting_stats.speaker_dict(transcription_service),
-                history=list(meeting_history),
+                history=list(self.meeting_history),
             )
 
             if report_path:
@@ -198,7 +198,21 @@ class TerminalInterface:
 
     def _handle_transcription(self, segment: TranscribedSegment) -> None:
         """Handle transcription callback (terminal display)."""
-        handle_transcription(segment)
+        # Store in meeting history
+        history_entry = {
+            "timestamp": segment.start_time.isoformat(),
+            "speaker_id": segment.speaker_id,
+            "speaker_name": segment.speaker_name,
+            "text": segment.text,
+            "similarity": segment.similarity,
+            "duration": segment.duration,
+        }
+        self.meeting_history.append(history_entry)
+
+        # Update statistics (optional, for evaluation if enabled)
+        if self.enable_evaluation:
+            # Could add evaluation logic here if needed
+            pass
 
         # Print to terminal
         timestamp = segment.start_time.strftime("%H:%M:%S")
@@ -206,8 +220,9 @@ class TerminalInterface:
         print(f"[{timestamp}] {segment.speaker_name}{similarity_str}: {segment.text}")
 
     def _handle_diarization_segment(self, segment: DiarizationSegment) -> None:
-        """Handle diarization callback."""
-        handle_diarization_segment(segment)
+        """Handle diarization callback (terminal mode - no action needed)."""
+        # In terminal mode, we don't need to broadcast diarization events
+        pass
 
     def run_interactive(self) -> None:
         """Run interactive terminal session."""
